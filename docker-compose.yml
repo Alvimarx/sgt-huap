@@ -1,0 +1,297 @@
+services:
+  # ==========================================
+  # APACHE LOAD BALANCER
+  # ==========================================
+  apache-lb:
+    image: httpd:2.4-alpine
+    container_name: huap-apache-lb
+    restart: always
+    # SEC (M-17): mínimo privilegio a nivel de runtime del contenedor. Apache arranca como
+    # root para poder bindear los puertos privilegiados 80/443, y LUEGO baja privilegios a
+    # "daemon" para los workers vía "User/Group daemon" en httpd.conf. Esa bajada de
+    # privilegios la hace el propio proceso maestro llamando a setuid()/setgid() — por eso,
+    # además de NET_BIND_SERVICE (para bindear el puerto), hacen falta SETUID/SETGID.
+    # Sin ellas (regresión detectada y corregida): setgid falla con "Operation not permitted"
+    # y los workers quedan corriendo como root en vez de "daemon" — verificado con
+    # `docker top`/`ps aux` antes y después (ver REVISION_POST_CORRECCIONES_SGT.md).
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "5173:80" # Puerto 5173 externo -> 80 interno (puerto 80 bloqueado por router)
+      - "443:443" # HTTPS (opcional, para producción)
+    volumes:
+      - ./apache/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
+      - ./apache/conf.d:/usr/local/apache2/conf/conf.d:ro
+    depends_on:
+      - backend-1
+      - backend-2
+      - backend-3
+      - frontend-1
+      - frontend-2
+      - frontend-3
+    networks:
+      - huap-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://localhost/apache-health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ==========================================
+  # BACKENDS (Spring Boot) - 3 instancias
+  # Se conectan a la BD ya creada en la PC.
+  # ==========================================
+  backend-1:
+    build:
+      context: ./huap_backend
+      dockerfile: Dockerfile
+    image: huap-backend-1:latest
+    container_name: huap-backend-1
+    restart: always
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "8080"
+    environment:
+      - DB_URL=${DB_URL:?define DB_URL en el archivo .env}
+      - DB_USERNAME=${DB_USERNAME:?define DB_USERNAME en el archivo .env}
+      - DB_PASSWORD=${DB_PASSWORD:?define DB_PASSWORD en el archivo .env}
+      - DDL_AUTO=${DDL_AUTO:-validate}
+      - JWT_SECRET=${JWT_SECRET:?define JWT_SECRET en el archivo .env}
+      - HOSPITAL_DB_URL=${HOSPITAL_DB_URL:?define HOSPITAL_DB_URL en el archivo .env}
+      - HOSPITAL_DB_USERNAME=${HOSPITAL_DB_USERNAME:?define HOSPITAL_DB_USERNAME en el archivo .env}
+      - HOSPITAL_DB_PASSWORD=${HOSPITAL_DB_PASSWORD:?define HOSPITAL_DB_PASSWORD en el archivo .env}
+      - SWAGGER_ENABLED=false
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:?define CORS_ALLOWED_ORIGINS en el archivo .env}
+      - LOGIN_LOCK_DURATION_MS=${LOGIN_LOCK_DURATION_MS:-900000}
+      - SERVER_ID=backend-1
+    networks:
+      - huap-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://localhost:8080/api/v2/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backend-2:
+    build:
+      context: ./huap_backend
+      dockerfile: Dockerfile
+    image: huap-backend-2:latest
+    container_name: huap-backend-2
+    restart: always
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "8080"
+    environment:
+      - DB_URL=${DB_URL:?define DB_URL en el archivo .env}
+      - DB_USERNAME=${DB_USERNAME:?define DB_USERNAME en el archivo .env}
+      - DB_PASSWORD=${DB_PASSWORD:?define DB_PASSWORD en el archivo .env}
+      - DDL_AUTO=${DDL_AUTO:-validate}
+      - JWT_SECRET=${JWT_SECRET:?define JWT_SECRET en el archivo .env}
+      - HOSPITAL_DB_URL=${HOSPITAL_DB_URL:?define HOSPITAL_DB_URL en el archivo .env}
+      - HOSPITAL_DB_USERNAME=${HOSPITAL_DB_USERNAME:?define HOSPITAL_DB_USERNAME en el archivo .env}
+      - HOSPITAL_DB_PASSWORD=${HOSPITAL_DB_PASSWORD:?define HOSPITAL_DB_PASSWORD en el archivo .env}
+      - SWAGGER_ENABLED=false
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:?define CORS_ALLOWED_ORIGINS en el archivo .env}
+      - LOGIN_LOCK_DURATION_MS=${LOGIN_LOCK_DURATION_MS:-900000}
+      - SERVER_ID=backend-2
+    networks:
+      - huap-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://localhost:8080/api/v2/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backend-3:
+    build:
+      context: ./huap_backend
+      dockerfile: Dockerfile
+    image: huap-backend-3:latest
+    container_name: huap-backend-3
+    restart: always
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "8080"
+    environment:
+      - DB_URL=${DB_URL:?define DB_URL en el archivo .env}
+      - DB_USERNAME=${DB_USERNAME:?define DB_USERNAME en el archivo .env}
+      - DB_PASSWORD=${DB_PASSWORD:?define DB_PASSWORD en el archivo .env}
+      - DDL_AUTO=${DDL_AUTO:-validate}
+      - JWT_SECRET=${JWT_SECRET:?define JWT_SECRET en el archivo .env}
+      - HOSPITAL_DB_URL=${HOSPITAL_DB_URL:?define HOSPITAL_DB_URL en el archivo .env}
+      - HOSPITAL_DB_USERNAME=${HOSPITAL_DB_USERNAME:?define HOSPITAL_DB_USERNAME en el archivo .env}
+      - HOSPITAL_DB_PASSWORD=${HOSPITAL_DB_PASSWORD:?define HOSPITAL_DB_PASSWORD en el archivo .env}
+      - SWAGGER_ENABLED=false
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:?define CORS_ALLOWED_ORIGINS en el archivo .env}
+      - LOGIN_LOCK_DURATION_MS=${LOGIN_LOCK_DURATION_MS:-900000}
+      - SERVER_ID=backend-3
+    networks:
+      - huap-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://localhost:8080/api/v2/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ==========================================
+  # FRONTENDS (React/Vite + Nginx) - 3 instancias
+  # ... (El resto de los servicios frontend quedan igual)
+  # ==========================================
+  frontend-1:
+    build:
+      context: ./sgt-huap_frontend
+      dockerfile: Dockerfile
+      args:
+        # La API pasa por el load balancer y expone la ruta actual del backend.
+        - VITE_API_BASE_URL=${VITE_API_BASE_URL:-/api/v2}
+    image: huap-frontend-1:latest
+    container_name: huap-frontend-1
+    restart: always
+    # SEC (M-17): ver nota en apache-lb — httpd necesita NET_BIND_SERVICE (puerto 80) y
+    # SETUID/SETGID (para bajar los workers a "daemon"); sin estas dos últimas los workers
+    # quedan corriendo como root, que es la regresión que corrige este cap_add.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "80"
+    networks:
+      - huap-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://localhost/" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  frontend-2:
+    build:
+      context: ./sgt-huap_frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_BASE_URL=${VITE_API_BASE_URL:-/api/v2}
+    image: huap-frontend-2:latest
+    container_name: huap-frontend-2
+    restart: always
+    # SEC (M-17): ver nota en apache-lb — httpd necesita NET_BIND_SERVICE (puerto 80) y
+    # SETUID/SETGID (para bajar los workers a "daemon"); sin estas dos últimas los workers
+    # quedan corriendo como root, que es la regresión que corrige este cap_add.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "80"
+    networks:
+      - huap-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://localhost/" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  frontend-3:
+    build:
+      context: ./sgt-huap_frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_BASE_URL=${VITE_API_BASE_URL:-/api/v2}
+    image: huap-frontend-3:latest
+    container_name: huap-frontend-3
+    restart: always
+    # SEC (M-17): ver nota en apache-lb — httpd necesita NET_BIND_SERVICE (puerto 80) y
+    # SETUID/SETGID (para bajar los workers a "daemon"); sin estas dos últimas los workers
+    # quedan corriendo como root, que es la regresión que corrige este cap_add.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "80"
+    networks:
+      - huap-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://localhost/" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ==========================================
+# REDES
+# ==========================================
+networks:
+  huap-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.55.0.0/16

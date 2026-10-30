@@ -1,0 +1,58 @@
+# ==============================================================
+# DESARROLLO — backend conectado a las DOS BASES DE DATOS EXTERNAS reales
+# (no levanta MySQL local). Un solo comando levanta todo:
+#
+#   docker compose -f docker-compose.dev.yml --env-file .env.dev up -d --build
+#
+# Variables reales en .env.dev (no versionado, ver .env.example para la plantilla):
+#   - DB_*          : BD propia del SGT (gestionturnos), externa.
+#   - HOSPITAL_DB_* : BD del hospital (viewPersonal, solo lectura), externa.
+#
+# NOTA: ambas BD son compartidas/reales. DDL_AUTO=validate en .env.dev evita
+# que Hibernate altere su esquema. Ver docs/AMBIENTE_DEV.md para más detalle
+# y troubleshooting de conectividad.
+# ==============================================================
+services:
+  backend:
+    build:
+      context: ./huap_backend
+      dockerfile: Dockerfile
+    container_name: huap-backend
+    restart: always
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env.dev
+    networks:
+      - huap-dev-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/api/v2/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  frontend:
+    build:
+      context: ./sgt-huap_frontend
+      dockerfile: Dockerfile
+      args:
+        # Relativa: el proxy de abajo reenvía /api/v2 al backend, así funciona
+        # tanto por localhost como por la IP de la LAN (celular, otra PC, etc.).
+        - VITE_API_BASE_URL=/api/v2
+    container_name: huap-frontend
+    restart: always
+    ports:
+      - "5173:80"
+    volumes:
+      # Agrega proxy reverso /api/v2 -> backend:8080 sobre la conf base del
+      # httpd.conf que genera el Dockerfile del frontend (ver apache/dev/httpd.conf).
+      - ./apache/dev/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
+    depends_on:
+      - backend
+    networks:
+      - huap-dev-network
+
+networks:
+  huap-dev-network:
+    driver: bridge

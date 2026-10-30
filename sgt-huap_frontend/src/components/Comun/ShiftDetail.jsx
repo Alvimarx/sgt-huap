@@ -1,0 +1,1012 @@
+// ShiftDetail.jsx
+// Componente compartido entre AgendaView y CalendarView.
+// Muestra el detalle completo de un turno dentro de un Sheet.
+
+import React from "react";
+import { SGT_DATA } from "../Admin2/data";
+import { SGTAvatar, SGTBadge, SGTIcon } from "../Style/UIPrimitives";
+import { useLayout } from "../../layout/layout";
+import DetalleTurnoDesktop from "../Desktop/turnos/DetalleTurnoDesktop";
+import { getTipoTurnoColor, getAgendaTeam, formatShiftLabel } from "./turnoPresentacion";
+import { yaEmpezo, yaTermino } from "../../utils/reglasTurno";
+
+// ---------------------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------------------
+
+const P2 = () => SGT_DATA.PALETTE;
+
+const isTurnoLibre = (shift) =>
+    Boolean(shift?.turnoLibre || shift?.idFuncionario == null);
+
+const mismoPuesto = (turno, puesto) => {
+    const idTurnoPuesto = turno?.idPuesto ?? turno?.raw?.idPuesto ?? "sin-puesto";
+    const idPuesto = puesto?.idPuesto ?? "sin-puesto";
+
+    return String(idTurnoPuesto) === String(idPuesto);
+};
+
+const isSinAsignarMember = (member) => {
+    const nombre = String(member?.nombre ?? "").trim().toLowerCase();
+    return nombre === "sin asignar" || nombre === "sin-asignar" || nombre === "sin asignado";
+};
+
+// ---------------------------------------------------------------------------
+// REGLAS DEL DETALLE (compartidas por la presentación móvil y la desktop, R18)
+// ---------------------------------------------------------------------------
+
+// Texto de la fila "Estado" del turno.
+const estadoDelTurno = (shift, turnoLibre) =>
+    shift.solicitudPendiente
+        ? `Solicitud pendiente${shift.solicitudCon ? ` con ${shift.solicitudCon}` : ""}`
+        : turnoLibre
+            ? `Cupo libre${shift.motivoLibre ? ` · ${shift.motivoLibre}` : ""}`
+            : shift.miTurno
+                ? "Tu turno"
+                : "Asignado";
+
+// Decisión del 23 oct: en un turno que ya terminó, la jefatura, el subrogante y el administrador
+// asignan, quitan o cambian al médico: es la corrección de quién lo hizo de verdad.
+const NOTA_CORREGIR_PASADO = "Turno pasado: puedes corregir quién lo hizo (asignar, quitar o cambiar). Queda en la bitácora.";
+
+// Equipo agrupado por puesto: cada integrante con el turno que se puede gestionar
+// y cada vacante con su estado (ya solicitada o no).
+const equipoPorPuesto = ({ porPuesto = [], turnosGrupo = [], canManageAssignments = false, selectedMemberId = null }) =>
+    porPuesto.map((puesto) => {
+        const vacantesDelPuesto = turnosGrupo.filter(
+            (turno) => isTurnoLibre(turno) && mismoPuesto(turno, puesto)
+        );
+
+        const integrantes = (puesto.integrantes || []).map((p) => {
+            const turnoAsociado = turnosGrupo.find((turno) => {
+                const mismoTurno =
+                    p.turnoId != null &&
+                    String(turno?.id) === String(p.turnoId);
+
+                const mismoFuncionarioYPuesto =
+                    p.id != null &&
+                    String(turno?.idFuncionario) === String(p.id) &&
+                    mismoPuesto(turno, puesto);
+
+                return !isTurnoLibre(turno) && (mismoTurno || mismoFuncionarioYPuesto);
+            });
+
+            return {
+                p,
+                turnoAsociado,
+                puedeGestionarEsteIntegrante: canManageAssignments && Boolean(turnoAsociado),
+                estaSeleccionado: p.esYo || String(p.id) === String(selectedMemberId),
+            };
+        });
+
+        // Vacante que el usuario YA solicitó (marca del backend): la tarjeta informa
+        // y deja de invitar — el backend igual rechazaría el duplicado, esto solo
+        // evita el viaje.
+        const vacantes = vacantesDelPuesto.map((vacante) => ({
+            vacante,
+            yaSolicitada: !canManageAssignments && Boolean(vacante.solicitudPendiente),
+            // 23 oct: sobre un turno que ya empezó no se pide nada; la gestión sí lo asigna.
+            yaEmpezada: !canManageAssignments && yaEmpezo(vacante),
+        }));
+
+        // Las vacantes de cada puesto se cuentan con los mismos turnos del grupo
+        // (buildAgendaData y buildTurnoTeams), así que toda vacante tiene su turno:
+        // no hay vacantes "solo por conteo" que dibujar aparte.
+        return {
+            puesto,
+            cantidadVacantes: vacantesDelPuesto.length || puesto.vacantes || 0,
+            integrantes,
+            vacantes,
+        };
+    });
+
+const alTocarIntegrante = (fila, { onManageAssignedTurn, onSelectMember }) => {
+    if (fila.puedeGestionarEsteIntegrante) {
+        onManageAssignedTurn?.(fila.turnoAsociado);
+        return;
+    }
+
+    onSelectMember?.(fila.p);
+};
+
+const alTocarVacante = ({ vacante, yaSolicitada, yaEmpezada }, canManageAssignments, { onAssignVacancy, onRequestVacancy }) => {
+    if (canManageAssignments) {
+        onAssignVacancy?.(vacante);
+    } else if (!yaSolicitada && !yaEmpezada) {
+        onRequestVacancy?.(vacante);
+    }
+};
+
+// Acciones del pie del detalle según el turno y los permisos.
+const accionesDelTurno = ({
+    shift,
+    canRequestExchange = false,
+    canManageTurnAssignment = false,
+    canAssignFreeTurn = false,
+}) => {
+    const actions = [];
+    const turnoLibre = isTurnoLibre(shift);
+
+    const canManageAssignments = Boolean(canManageTurnAssignment || canAssignFreeTurn);
+    // 23 oct: sobre un turno que ya empezó no se pide ni se cambia nada (las solicitudes
+    // vencen). La gestión sí puede asignarlo, quitarlo o cambiarlo: es el registro de quién lo hizo.
+    const empezado = yaEmpezo(shift);
+
+    if (!shift?.solicitudPendiente) {
+        if (canManageAssignments && turnoLibre) {
+            actions.push({
+                id: "asignar-turno-libre",
+                label: "Asignar funcionario",
+                icon: "user-plus",
+                tone: "primary",
+                targetShift: shift,
+            });
+        }
+
+        if (turnoLibre && !empezado) {
+            actions.push({
+                id: "solicitar-turno",
+                label: "Solicitar turno",
+                icon: "plus",
+                tone: canManageAssignments ? "ghost" : "primary",
+                targetShift: shift,
+            });
+        }
+
+        if (!turnoLibre && !canManageAssignments && !empezado) {
+            actions.push({
+                id: "cambio",
+                label: canRequestExchange ? "Solicitar cambio" : "Selecciona receptor y su turno",
+                icon: "swap",
+                tone: canRequestExchange ? "primary" : "ghost",
+                disabled: !canRequestExchange,
+                targetShift: shift,
+            });
+        }
+
+        if (!turnoLibre && canManageAssignments && canRequestExchange && !empezado) {
+            actions.push({
+                id: "cambio",
+                label: "Solicitar cambio",
+                icon: "swap",
+                tone: "ghost",
+                disabled: false,
+                targetShift: shift,
+            });
+        }
+    }
+
+    // «Ver historial» abre el historial de ESTE turno (C-06, 17 oct 2026: GET
+    // /bitacoras/turno/{id}). La gestión lo ve en los turnos de su servicio,
+    // también en los cupos; el médico, solo en los suyos: el backend le
+    // responde 403 en los demás, así que no se le ofrece en turnos ajenos ni
+    // en cupos.
+    if (canManageAssignments || (shift?.miTurno && !turnoLibre)) {
+        actions.push({
+            id: "historial",
+            label: "Ver historial",
+            icon: "history",
+            tone: "ghost",
+            targetShift: shift,
+        });
+    }
+
+    return actions;
+};
+
+const DIAS_LARGO = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
+const MESES_LARGO = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
+
+// "2026-10-21" → "Miércoles 21 de octubre de 2026" (solo presentación desktop).
+const fechaLarga = (fecha) => {
+    const m = String(fecha || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return fecha ? `Fecha: ${fecha}` : "Fecha no disponible";
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    const dia = DIAS_LARGO[d.getDay()];
+    return `${dia.charAt(0).toUpperCase()}${dia.slice(1)} ${d.getDate()} de ${MESES_LARGO[d.getMonth()]} de ${d.getFullYear()}`;
+};
+
+// ---------------------------------------------------------------------------
+// SHIFTDETAIL
+// ---------------------------------------------------------------------------
+
+/**
+ * Contenido del Sheet de detalle de un turno.
+ *
+ * Props principales:
+ *   shift                       turno normalizado
+ *   onAction(actionId, shift)   callback para acciones
+ *   exchangeSelection           estado de selección de intercambio
+ *   onSelectTargetFuncionario   callback al seleccionar receptor
+ *   canManageTurnAssignment     true para admin/flujo gestión asignación
+ *   canAssignFreeTurn           compatibilidad con flujo antiguo
+ */
+const ShiftDetail = ({
+    shift,
+    onAction,
+    exchangeSelection,
+    onSelectTargetFuncionario,
+    canManageTurnAssignment = false,
+    canAssignFreeTurn = false,
+}) => {
+    const { esDesktop } = useLayout();
+
+    if (!shift) {
+        return null;
+    }
+
+    const teamColor = getTipoTurnoColor(shift);
+    const fecha = shift.fecha || shift.raw?.diaInicioTurno || null;
+    const turnoLibre = isTurnoLibre(shift);
+
+    const groupData = shift.teamGroup ?? null;
+    const legacyTeam = shift.team ? getAgendaTeam(shift) : null;
+
+    const canManageAssignments = Boolean(canManageTurnAssignment || canAssignFreeTurn);
+    const turnosGrupo = groupData?.turnos || [];
+
+    const handleAssignVacancy = (vacantShift) => {
+        if (!vacantShift || !onAction) return;
+        onAction("asignar-turno-libre", vacantShift);
+    };
+
+    const handleManageAssignedTurn = (targetShift) => {
+        if (!targetShift || !onAction) return;
+        onAction("editar-asignacion-turno", targetShift);
+    };
+
+    const handleRequestVacancy = (vacantShift) => {
+        if (!vacantShift || !onAction) return;
+        onAction("solicitar-turno", vacantShift);
+    };
+
+    const totalTurnos = groupData?.totalTurnos ?? null;
+    const asignados = groupData?.asignados ?? null;
+    const equipoCompleto = groupData?.completo ?? false;
+    const faltanPorCubrir =
+        totalTurnos != null && asignados != null
+            ? Math.max(totalTurnos - asignados, 0)
+            : null;
+
+    const selectedTargetTurn = exchangeSelection?.targetTurn ?? null;
+    const selectedTargetFuncionario = exchangeSelection?.targetFuncionario ?? null;
+
+    const isTargetSelection = Boolean(
+        !shift.miTurno &&
+        selectedTargetTurn?.id === shift.id &&
+        selectedTargetFuncionario
+    );
+
+    const canRequestExchange = Boolean(
+        shift.miTurno ||
+        (!shift.miTurno &&
+            selectedTargetTurn &&
+            selectedTargetFuncionario &&
+            selectedTargetTurn.id === shift.id)
+    );
+
+    const handleExchangeAction = () => {
+        if (!canRequestExchange || !onAction) return;
+        onAction("cambio", shift);
+    };
+
+    const handleSelectTarget = (member) => {
+        const targetTurn =
+            groupData?.turnos?.find((t) =>
+                String(t.id) === String(member?.turnoId ?? member?.id ?? "") ||
+                String(t.idFuncionario) === String(member?.id ?? "")
+            ) || null;
+
+        onSelectTargetFuncionario?.(shift, targetTurn || member);
+    };
+
+    const onSelectMember = onSelectTargetFuncionario ? handleSelectTarget : undefined;
+
+    const handleShiftAction = (actionId, currentShift) => {
+        if (actionId === "cambio") {
+            handleExchangeAction();
+            return;
+        }
+
+        onAction?.(actionId, currentShift);
+    };
+
+    // Acciones del pie, las mismas en móvil y desktop. Si no hay ninguna (por
+    // ejemplo, en el cupo que el médico ya pidió), no se muestra la sección.
+    const acciones = accionesDelTurno({
+        shift,
+        canRequestExchange,
+        canManageTurnAssignment,
+        canAssignFreeTurn,
+    });
+
+    // Rama desktop (R18): mismas reglas (helpers de arriba), otra presentación.
+    if (esDesktop) {
+        const nombreTipo =
+            shift.nombreTipoTurno ||
+            shift.nombreTipo ||
+            shift.nombre ||
+            (shift.tipo === "dia" ? "Turno día" : "Turno noche");
+        const nombreRotativa = shift.nombreRotativa || groupData?.nombreRotativa;
+        const receptorId = selectedTargetFuncionario?.id;
+
+        const info = [{ etiqueta: "Estado", valor: estadoDelTurno(shift, turnoLibre) }];
+        if (canManageAssignments && yaTermino(shift)) info.push({ etiqueta: "Registro", valor: NOTA_CORREGIR_PASADO });
+        if (!turnoLibre && shift.nombreFuncionario) info.push({ etiqueta: "Funcionario", valor: shift.nombreFuncionario });
+        if (shift.nombrePuesto) info.push({ etiqueta: "Puesto", valor: shift.nombrePuesto });
+        if (shift.horas != null) info.push({ etiqueta: "Duración", valor: `${shift.horas} horas` });
+
+        const integranteDesktop = (fila) => ({
+            clave: fila.p.turnoId ?? fila.p.id,
+            p: fila.p,
+            puedeGestionar: fila.puedeGestionarEsteIntegrante,
+            seleccionado: fila.estaSeleccionado,
+            esReceptor: !fila.p.esYo && receptorId != null && String(fila.p.id) === String(receptorId),
+            onClick: () => alTocarIntegrante(fila, { onManageAssignedTurn: handleManageAssignedTurn, onSelectMember }),
+        });
+
+        const equipo = groupData?.porPuesto?.length > 0
+            ? equipoPorPuesto({
+                porPuesto: groupData.porPuesto,
+                turnosGrupo,
+                canManageAssignments,
+                selectedMemberId: receptorId,
+            }).map((fila) => ({
+                clave: fila.puesto.idPuesto ?? "sin-puesto",
+                nombrePuesto: fila.puesto.nombrePuesto,
+                cantidadVacantes: fila.cantidadVacantes,
+                integrantes: fila.integrantes.map(integranteDesktop),
+                vacantes: fila.vacantes.map((v, i) => ({
+                    clave: `vacante-${v.vacante.id ?? i}`,
+                    yaSolicitada: v.yaSolicitada,
+                    yaEmpezada: v.yaEmpezada,
+                    onClick: () => alTocarVacante(v, canManageAssignments, {
+                        onAssignVacancy: handleAssignVacancy,
+                        onRequestVacancy: handleRequestVacancy,
+                    }),
+                })),
+            }))
+            : null;
+
+        let equipoLegado = null;
+        if (!groupData && legacyTeam) {
+            const integrantes = [
+                legacyTeam.jefe,
+                ...(legacyTeam.urgenciologos || []),
+                ...(legacyTeam.medicos || []),
+            ].filter(Boolean);
+            const visibles = integrantes.length > 0 && isSinAsignarMember(integrantes[0]) ? [] : integrantes;
+            equipoLegado = {
+                visibles: visibles.length,
+                integrantes: integrantes.map((p) => ({
+                    clave: p.turnoId ?? p.id,
+                    p,
+                    puedeGestionar: false,
+                    seleccionado: p.esYo || String(p.id) === String(receptorId),
+                    esReceptor: !p.esYo && receptorId != null && String(p.id) === String(receptorId),
+                    onClick: onSelectMember ? () => onSelectMember(p) : undefined,
+                })),
+            };
+        }
+
+        const accionesDesktop = acciones.map((a) => ({
+            ...a,
+            clave: `${a.id}-${a.targetShift?.id ?? "actual"}`,
+            onClick: () => handleShiftAction(a.id, a.targetShift || shift),
+        }));
+
+        return (
+            <DetalleTurnoDesktop
+                tipo={shift.tipo}
+                titulo={`${nombreTipo}${nombreRotativa ? ` · ${nombreRotativa}` : ""}`}
+                horario={`${shift.inicio || "—"} – ${shift.fin || "—"}`}
+                fecha={fechaLarga(fecha)}
+                cobertura={totalTurnos != null ? {
+                    completo: equipoCompleto,
+                    asignados,
+                    total: totalTurnos,
+                    faltan: faltanPorCubrir,
+                } : null}
+                receptor={selectedTargetTurn && selectedTargetFuncionario ? {
+                    texto: `${selectedTargetFuncionario.nombre} · ${formatShiftLabel(selectedTargetTurn)}`,
+                    activo: isTargetSelection,
+                } : null}
+                info={info}
+                equipo={equipo}
+                equipoLegado={equipoLegado}
+                acciones={accionesDesktop}
+                puedeGestionar={canManageAssignments}
+                sePuedeElegirReceptor={Boolean(onSelectMember) && !canManageAssignments}
+            />
+        );
+    }
+
+    return (
+        <div
+            style={{
+                padding: "0 16px 20px",
+                display: "flex",
+                flexDirection: "column",
+                gap: 14,
+            }}
+        >
+            {/* Header con tipo y horario */}
+            <div
+                style={{
+                    background: teamColor.bg,
+                    border: `1px solid ${teamColor.soft}`,
+                    borderRadius: 14,
+                    padding: 14,
+                }}
+            >
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+                    <SGTIcon
+                        name={shift.tipo === "dia" ? "sun" : "moon"}
+                        size={18}
+                        color={teamColor.ink}
+                    />
+
+                    <span
+                        style={{
+                            fontSize: 13,
+                            fontWeight: 800,
+                            color: teamColor.ink,
+                            textTransform: "uppercase",
+                        }}
+                    >
+                        {(shift.nombreTipoTurno ||
+                            shift.nombreTipo ||
+                            shift.nombre ||
+                            (shift.tipo === "dia" ? "Turno día" : "Turno noche")) +
+                            (shift.nombreRotativa || groupData?.nombreRotativa
+                                ? `: ${shift.nombreRotativa || groupData.nombreRotativa}`
+                                : "")}
+                    </span>
+                </div>
+
+                <div style={{ fontSize: 22, fontWeight: 800, color: teamColor.ink }}>
+                    {shift.inicio || "—"} – {shift.fin || "—"}
+                </div>
+
+                <div style={{ marginTop: 8, fontSize: 12.5, color: teamColor.ink }}>
+                    {fecha ? `Fecha: ${fecha}` : "Fecha no disponible"}
+                </div>
+
+                {totalTurnos != null && (
+                    <div
+                        style={{
+                            marginTop: 10,
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 6,
+                            background: "rgba(255,255,255,0.7)",
+                            borderRadius: 999,
+                            padding: "5px 10px",
+                        }}
+                    >
+                        <SGTIcon
+                            name={equipoCompleto ? "check-circle" : "users"}
+                            size={13}
+                            color={teamColor.ink}
+                        />
+
+                        <span style={{ fontSize: 12, fontWeight: 800, color: teamColor.ink }}>
+                            {equipoCompleto
+                                ? `Equipo completo · ${asignados}/${totalTurnos}`
+                                : `${asignados}/${totalTurnos} asignados · faltan ${faltanPorCubrir}`}
+                        </span>
+                    </div>
+                )}
+            </div>
+
+            {/* Badge de selección de intercambio */}
+            {selectedTargetTurn && selectedTargetFuncionario && (
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <SGTBadge tone={isTargetSelection ? "accent" : "neutral"} size="xs">
+                        Receptor: {selectedTargetFuncionario.nombre} · {formatShiftLabel(selectedTargetTurn)}
+                    </SGTBadge>
+                </div>
+            )}
+
+            {/* Información del turno */}
+            <div>
+                <SectionLabel>Información del turno</SectionLabel>
+
+                <div
+                    style={{
+                        border: `1px solid ${P2().line}`,
+                        borderRadius: 12,
+                        background: "#fff",
+                        padding: 12,
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 8,
+                    }}
+                >
+                    <DetailRow
+                        label="Estado"
+                        value={estadoDelTurno(shift, turnoLibre)}
+                    />
+
+                    {canManageAssignments && yaTermino(shift) && (
+                        <DetailRow label="Registro" value={NOTA_CORREGIR_PASADO} />
+                    )}
+
+                    {!turnoLibre && shift.nombreFuncionario && (
+                        <DetailRow label="Funcionario" value={shift.nombreFuncionario} />
+                    )}
+
+                    {shift.nombrePuesto && (
+                        <DetailRow label="Puesto" value={shift.nombrePuesto} />
+                    )}
+
+                    {shift.horas != null && (
+                        <DetailRow label="Duración" value={`${shift.horas} horas`} />
+                    )}
+                </div>
+            </div>
+
+            {/* Equipo agrupado por puesto */}
+            {groupData?.porPuesto?.length > 0 && (
+                <div>
+                    <SectionLabel>Integrantes del equipo por puesto</SectionLabel>
+
+                    <TeamByPuesto
+                        porPuesto={groupData.porPuesto}
+                        turnosGrupo={turnosGrupo}
+                        canManageAssignments={canManageAssignments}
+                        onAssignVacancy={handleAssignVacancy}
+                        onRequestVacancy={handleRequestVacancy}
+                        onManageAssignedTurn={handleManageAssignedTurn}
+                        onSelectMember={onSelectTargetFuncionario ? handleSelectTarget : undefined}
+                        selectedMemberId={selectedTargetFuncionario?.id}
+                    />
+                </div>
+            )}
+
+            {/* Equipo legacy */}
+            {!groupData && legacyTeam && (
+                <div>
+                    <SectionLabel>Integrantes del mismo puesto y tipo</SectionLabel>
+
+                    <TeamGroup
+                        group={{
+                            nombrePuesto: null,
+                            integrantes: [
+                                legacyTeam.jefe,
+                                ...(legacyTeam.urgenciologos || []),
+                                ...(legacyTeam.medicos || []),
+                            ].filter(Boolean),
+                        }}
+                        onSelectMember={onSelectTargetFuncionario ? handleSelectTarget : undefined}
+                        selectedMemberId={selectedTargetFuncionario?.id}
+                    />
+                </div>
+            )}
+
+            {/* Acciones */}
+            {acciones.length > 0 && (
+                <div>
+                    <SectionLabel>Acciones</SectionLabel>
+
+                    <ShiftActions
+                        shift={shift}
+                        actions={acciones}
+                        onAction={handleShiftAction}
+                    />
+                </div>
+            )}
+        </div>
+    );
+};
+
+// ---------------------------------------------------------------------------
+// SUB-COMPONENTES
+// ---------------------------------------------------------------------------
+
+const SectionLabel = ({ children }) => (
+    <div
+        style={{
+            fontSize: 12,
+            fontWeight: 800,
+            color: P2().ink3,
+            textTransform: "uppercase",
+            marginBottom: 8,
+        }}
+    >
+        {children}
+    </div>
+);
+
+const DetailRow = ({ label, value }) => (
+    <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+        <span style={{ color: P2().ink3, fontSize: 12, fontWeight: 700 }}>
+            {label}
+        </span>
+
+        <span
+            style={{
+                color: P2().ink,
+                fontSize: 12.5,
+                fontWeight: 800,
+                textAlign: "right",
+            }}
+        >
+            {value}
+        </span>
+    </div>
+);
+
+const TeamGroup = ({ group, onSelectMember, selectedMemberId = null }) => {
+    const { integrantes = [] } = group;
+    const visibles =
+        integrantes.length > 0 && isSinAsignarMember(integrantes[0])
+            ? []
+            : integrantes;
+
+    return (
+        <div
+            style={{
+                border: `1px solid ${P2().line}`,
+                borderRadius: 12,
+                background: "#fff",
+                overflow: "hidden",
+            }}
+        >
+            <div
+                style={{
+                    padding: "8px 12px",
+                    borderBottom: `1px solid ${P2().line2}`,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                }}
+            >
+                <span
+                    style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                        fontSize: 12,
+                        fontWeight: 700,
+                        color: P2().ink2,
+                    }}
+                >
+                    <SGTIcon name="users" size={13} color={P2().ink2} />
+                    {visibles.length} persona{visibles.length !== 1 ? "s" : ""}
+                </span>
+            </div>
+
+            <div style={{ padding: "4px 8px 8px" }}>
+                {integrantes.map((p) => (
+                    <button
+                        key={p.turnoId ?? p.id}
+                        type="button"
+                        onClick={() => onSelectMember?.(p)}
+                        style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 10,
+                            padding: "7px 6px",
+                            borderRadius: 8,
+                            marginTop: 2,
+                            background:
+                                p.esYo || String(p.id) === String(selectedMemberId)
+                                    ? P2().primarySoft
+                                    : "transparent",
+                            border: "none",
+                            width: "100%",
+                            textAlign: "left",
+                            cursor: onSelectMember ? "pointer" : "default",
+                        }}
+                    >
+                        <SGTAvatar person={p} size={28} />
+
+                        <span
+                            style={{
+                                fontSize: 13,
+                                fontWeight:
+                                    p.esYo || String(p.id) === String(selectedMemberId)
+                                        ? 800
+                                        : 500,
+                                color: P2().ink,
+                                flex: 1,
+                            }}
+                        >
+                            {p.nombre}
+                            {p.esYo && (
+                                <span
+                                    style={{
+                                        marginLeft: 6,
+                                        fontSize: 11,
+                                        fontWeight: 700,
+                                        color: P2().primary,
+                                    }}
+                                >
+                                    (tú)
+                                </span>
+                            )}
+                        </span>
+                    </button>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+const TeamByPuesto = ({
+    porPuesto = [],
+    turnosGrupo = [],
+    onSelectMember,
+    selectedMemberId = null,
+    canManageAssignments = false,
+    onAssignVacancy,
+    onRequestVacancy,
+    onManageAssignedTurn,
+}) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {equipoPorPuesto({ porPuesto, turnosGrupo, canManageAssignments, selectedMemberId }).map(({ puesto, cantidadVacantes, integrantes, vacantes }) => {
+            return (
+                <div
+                    key={puesto.idPuesto ?? "sin-puesto"}
+                    style={{
+                        border: `1px solid ${P2().line}`,
+                        borderRadius: 12,
+                        background: "#fff",
+                        overflow: "hidden",
+                    }}
+                >
+                    <div
+                        style={{
+                            padding: "8px 12px",
+                            borderBottom: `1px solid ${P2().line2}`,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: 8,
+                        }}
+                    >
+                        <span
+                            style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                gap: 6,
+                                fontSize: 12.5,
+                                fontWeight: 800,
+                                color: P2().ink,
+                            }}
+                        >
+                            <SGTIcon name="home" size={13} color={P2().ink2} />
+                            {puesto.nombrePuesto}
+                        </span>
+
+                        {cantidadVacantes > 0 && (
+                            <SGTBadge tone="accent" size="xs">
+                                Falta cubrir{cantidadVacantes > 1 ? ` ×${cantidadVacantes}` : ""}
+                            </SGTBadge>
+                        )}
+                    </div>
+
+                    <div style={{ padding: "4px 8px 8px" }}>
+                        {integrantes.map((fila) => {
+                            const { p, puedeGestionarEsteIntegrante, estaSeleccionado } = fila;
+
+                            return (
+                                <button
+                                    key={p.turnoId ?? p.id}
+                                    type="button"
+                                    onClick={() => alTocarIntegrante(fila, { onManageAssignedTurn, onSelectMember })}
+                                    style={{
+                                        display: "flex",
+                                        alignItems: "center",
+                                        gap: 10,
+                                        padding: "7px 6px",
+                                        borderRadius: 8,
+                                        marginTop: 2,
+                                        background: puedeGestionarEsteIntegrante
+                                            ? P2().primarySoft
+                                            : estaSeleccionado
+                                                ? P2().primarySoft
+                                                : "transparent",
+                                        border: puedeGestionarEsteIntegrante
+                                            ? `1px solid ${P2().line2}`
+                                            : "none",
+                                        width: "100%",
+                                        textAlign: "left",
+                                        cursor: puedeGestionarEsteIntegrante || onSelectMember
+                                            ? "pointer"
+                                            : "default",
+                                    }}
+                                >
+                                    <SGTAvatar person={p} size={28} />
+
+                                    <span
+                                        style={{
+                                            fontSize: 13,
+                                            fontWeight: puedeGestionarEsteIntegrante || estaSeleccionado ? 800 : 500,
+                                            color: P2().ink,
+                                            flex: 1,
+                                        }}
+                                    >
+                                        {p.nombre}
+                                        {p.esYo && (
+                                            <span
+                                                style={{
+                                                    marginLeft: 6,
+                                                    fontSize: 11,
+                                                    fontWeight: 700,
+                                                    color: P2().primary,
+                                                }}
+                                            >
+                                                (tú)
+                                            </span>
+                                        )}
+                                    </span>
+
+                                    {puedeGestionarEsteIntegrante && (
+                                        <span
+                                            style={{
+                                                display: "inline-flex",
+                                                alignItems: "center",
+                                                gap: 4,
+                                                fontSize: 11,
+                                                fontWeight: 800,
+                                                color: P2().primary,
+                                            }}
+                                        >
+                                            Editar
+                                            <SGTIcon name="chevron-right" size={12} color={P2().primary} />
+                                        </span>
+                                    )}
+                                </button>
+                            );
+                        })}
+
+                        {vacantes.map((fila, i) => {
+                            // yaSolicitada: vacante que el usuario YA solicitó (ver equipoPorPuesto).
+                            const { vacante, yaSolicitada, yaEmpezada } = fila;
+                            // Cerrada: ya la pidió o el turno ya empezó (no se pide nada).
+                            const cerrada = yaSolicitada || yaEmpezada;
+                            return (
+                            <button
+                                key={`vacante-${vacante.id ?? i}`}
+                                type="button"
+                                disabled={cerrada}
+                                onClick={() => alTocarVacante(fila, canManageAssignments, { onAssignVacancy, onRequestVacancy })}
+                                style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: 10,
+                                    padding: "8px 6px",
+                                    borderRadius: 8,
+                                    marginTop: 4,
+                                    border: canManageAssignments
+                                        ? `1px dashed ${P2().primary}`
+                                        : cerrada
+                                            ? `1px dashed ${P2().line}`
+                                            : `1px dashed ${P2().accent}`,
+                                    background: canManageAssignments
+                                        ? P2().primarySoft
+                                        : cerrada
+                                            ? P2().surface2
+                                            : P2().accentSoft,
+                                    width: "100%",
+                                    textAlign: "left",
+                                    cursor: cerrada ? "default" : "pointer",
+                                }}
+                            >
+                                <div
+                                    style={{
+                                        width: 28,
+                                        height: 28,
+                                        borderRadius: 99,
+                                        border: `1.5px dashed ${
+                                            canManageAssignments ? P2().primary : cerrada ? P2().ink3 : P2().accent
+                                        }`,
+                                        display: "grid",
+                                        placeItems: "center",
+                                        flexShrink: 0,
+                                    }}
+                                >
+                                    <SGTIcon
+                                        name={canManageAssignments ? "user-plus" : cerrada ? "check" : "hand-raised"}
+                                        size={13}
+                                        color={canManageAssignments ? P2().primary : cerrada ? P2().ink3 : "#B85A60"}
+                                    />
+                                </div>
+
+                                <span
+                                    style={{
+                                        fontSize: 12.5,
+                                        fontWeight: 800,
+                                        color: canManageAssignments ? P2().primary : cerrada ? P2().ink3 : "#B85A60",
+                                        flex: 1,
+                                    }}
+                                >
+                                    {canManageAssignments
+                                        ? "Asignar funcionario a este cupo"
+                                        : yaSolicitada
+                                            ? "Ya solicitaste este turno"
+                                            : yaEmpezada
+                                                ? "Este turno ya empezó"
+                                                : "Cupo libre — tocar para solicitar"}
+                                </span>
+
+                                {!cerrada && (
+                                    <SGTIcon
+                                        name="chevron-right"
+                                        size={13}
+                                        color={canManageAssignments ? P2().primary : "#B85A60"}
+                                    />
+                                )}
+                            </button>
+                            );
+                        })}
+                    </div>
+                </div>
+            );
+        })}
+    </div>
+);
+
+// actions: las de accionesDelTurno, ya calculadas por ShiftDetail.
+const ShiftActions = ({ shift, actions, onAction }) => {
+    return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {actions.map((a) => (
+                <ActionBtn
+                    key={`${a.id}-${a.targetShift?.id ?? "actual"}`}
+                    {...a}
+                    onClick={() => onAction?.(a.id, a.targetShift || shift)}
+                />
+            ))}
+        </div>
+    );
+};
+
+const ActionBtn = ({ label, icon, tone = "primary", onClick, disabled = false }) => {
+    const tones = {
+        primary: { bg: P2().primary, ink: "#fff", bd: P2().primary },
+        ghost: { bg: "#fff", ink: P2().ink, bd: P2().line },
+        danger: { bg: "#FFF4F5", ink: "#B42318", bd: "#FDA29B" },
+    };
+
+    const t = tones[tone] || tones.primary;
+
+    return (
+        <button
+            type="button"
+            onClick={onClick}
+            disabled={disabled}
+            style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                background: t.bg,
+                color: disabled ? P2().ink3 : t.ink,
+                border: `1px solid ${disabled ? P2().line2 : t.bd}`,
+                padding: "12px 14px",
+                borderRadius: 12,
+                fontSize: 14,
+                fontWeight: 700,
+                cursor: disabled ? "not-allowed" : "pointer",
+                textAlign: "left",
+                opacity: disabled ? 0.7 : 1,
+                width: "100%",
+            }}
+        >
+            <SGTIcon name={icon} size={17} color={disabled ? P2().ink3 : t.ink} />
+
+            <span style={{ flex: 1 }}>{label}</span>
+
+            <SGTIcon
+                name="chevron-right"
+                size={14}
+                color={disabled ? P2().ink3 : t.ink}
+                strokeWidth={2.4}
+            />
+        </button>
+    );
+};
+
+export default ShiftDetail;

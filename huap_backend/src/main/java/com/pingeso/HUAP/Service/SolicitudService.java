@@ -1,0 +1,902 @@
+package com.pingeso.HUAP.Service;
+
+import com.pingeso.HUAP.DTO.CrearSolicitudDTO;
+import com.pingeso.HUAP.Entity.*;
+import com.pingeso.HUAP.Repository.*;
+import com.pingeso.HUAP.Security.AlcanceServicio;
+import com.pingeso.HUAP.Security.SeguridadServicio;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.web.server.ResponseStatusException;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Objects;
+import java.util.stream.Stream;
+
+/**
+ * Servicio de solicitudes y ofertas de turnos.
+ *
+ * <p>Cubre la creación y el ciclo de vida de las {@code Solicitud} (intercambio de turnos,
+ * oferta particular a un médico y oferta general al servicio), la respuesta de los
+ * receptores (aceptar/rechazar), el cambio de estado y la modificación del motivo.
+ * Al resolverse una solicitud, coordina la reasignación de los turnos implicados.
+ *
+ * <p>Antes de crear una solicitud que agregaría un turno a un funcionario (Cobertura,
+ * Intercambio, Oferta particular), y de nuevo — de forma obligatoria — al aprobarla, se valida
+ * mediante {@link ValidadorAsignacionTurnoService} que el calendario resultante del funcionario
+ * no quede con turnos superpuestos ni con una secuencia incompatible de dos turnos de 12 horas
+ * consecutivos sin descanso (corrección funcional "turnos de 12 horas", ver
+ * {@code Archivo de funcionalidades.md}). La revalidación en la aprobación es indispensable porque
+ * el calendario del funcionario puede haber cambiado entre la creación de la solicitud y su
+ * aprobación.
+ */
+@Service
+@RequiredArgsConstructor
+public class SolicitudService {
+
+    private final SolicitudRepository solicitudRepository;
+    private final FuncionarioRepository funcionarioRepository;
+    private final TipoSolicitudRepository tipoSolicitudRepository;
+    private final TurnoRepository turnoRepository;
+    private final BitacoraService bitacoraService;
+    private final ValidadorAsignacionTurnoService validadorAsignacion;
+    private final SeguridadServicio seguridadServicio;
+
+    /**
+     * Motivo con que se cierra sola una solicitud pendiente cuyo turno ya empezó (decisión del 23 oct).
+     * Reutiliza el estado {@code RECHAZADA}, como la asignación manual: no hay estado nuevo ni migración.
+     * La pantalla reconoce las vencidas por este prefijo.
+     */
+    public static final String MOTIVO_VENCIDA = "Venció: el turno ya comenzó";
+
+    /** Evento de sistema, sin actor humano, que deja el vencimiento en la bitácora. */
+    static final String EVENTO_VENCIDA = "SOLICITUD_VENCIDA";
+
+    /** Ahora, en la hora del servidor (el backend corre con {@code TZ=America/Santiago}). Las pruebas lo fijan. */
+    LocalDateTime ahora() {
+        return LocalDateTime.now();
+    }
+
+    /** Solicitudes visibles para la sesión (ver {@link #acotarLectura}). */
+    @Transactional
+    public List<SolicitudEntity> findAllSolicitudes() {
+        return vencerAlLeer(acotarLectura(solicitudRepository.findAll()));
+    }
+
+    /** Solicitudes emitidas por el funcionario (el que las crea, no el receptor). */
+    @Transactional
+    public List<SolicitudEntity> findByFuncionario(Long idFuncionario) {
+        return vencerAlLeer(acotarLecturaDe(idFuncionario, solicitudRepository.findByFuncionario_IdFuncionario(idFuncionario)));
+    }
+
+    /** Solicitudes donde el funcionario es el receptor (intercambio u oferta particular). */
+    @Transactional
+    public List<SolicitudEntity> findByFuncionarioReceptor(Long idFuncionario) {
+        return vencerAlLeer(acotarLecturaDe(idFuncionario, solicitudRepository.findByFuncionarioReceptor_IdFuncionario(idFuncionario)));
+    }
+
+    /** Solicitudes de un tipo (Tipo_Solicitud.tipo: 1=Permiso, 2=Botar turno, 3=Cobertura, 4=Intercambio, 5=Oferta particular). */
+    @Transactional
+    public List<SolicitudEntity> findByTipoSolicitud(Long idTipoSolicitud) {
+        return vencerAlLeer(acotarLectura(solicitudRepository.findByTipoSolicitud_IdTipoSolicitud(idTipoSolicitud)));
+    }
+
+    /** Solicitudes asociadas a un turno (como turno solicitado o como turno propio en un intercambio). */
+    @Transactional
+    public List<SolicitudEntity> findByTurno(Long idTurno) {
+        return vencerAlLeer(acotarLectura(solicitudRepository.findByTurno_IdTurno(idTurno)));
+    }
+
+    /**
+     * SEC (C-17, BUG-002): alcance de lectura de las solicitudes. Antes cualquier autenticado
+     * recibía las de todo el hospital. El ADMINISTRADOR ve todas; la gestión (JEFATURA,
+     * SUBROGANTE), las de su servicio ({@link AlcanceServicio#solicitudEsDelServicio}); cualquier
+     * otro rol, solo aquellas en las que participa como emisor o receptor.
+     */
+    private List<SolicitudEntity> acotarLectura(List<SolicitudEntity> solicitudes) {
+        if (seguridadServicio.esAdministrador()) return solicitudes;
+        if (seguridadServicio.esGestionDelServicio()) {
+            Long servicioSesion = seguridadServicio.idServicioActual();
+            return solicitudes.stream()
+                    .filter(s -> AlcanceServicio.solicitudEsDelServicio(s, servicioSesion))
+                    .toList();
+        }
+        Long idUsuario = seguridadServicio.idUsuarioActual();
+        return solicitudes.stream()
+                .filter(s -> AlcanceServicio.participaEnSolicitud(s, idUsuario))
+                .toList();
+    }
+
+    /**
+     * Igual que {@link #acotarLectura}, para los listados de una persona: las propias se ven
+     * completas; las de otra persona, solo la gestión (y las de su servicio) o el ADMINISTRADOR.
+     */
+    private List<SolicitudEntity> acotarLecturaDe(Long idFuncionario, List<SolicitudEntity> solicitudes) {
+        if (seguridadServicio.esAdministrador()
+                || Objects.equals(idFuncionario, seguridadServicio.idUsuarioActual())) {
+            return solicitudes;
+        }
+        if (!seguridadServicio.esGestionDelServicio()) {
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "No puedes consultar las solicitudes de otro funcionario");
+        }
+        return acotarLectura(solicitudes);
+    }
+
+    /*
+       Modificadores y utilidades
+    */
+
+    /**
+     * Crea una solicitud en estado {@code PENDIENTE}. No reasigna ningún turno todavía:
+     * eso solo ocurre al aprobarla en {@link #cambiarEstado}.
+     */
+    @Transactional
+    public SolicitudEntity crearSolicitud(CrearSolicitudDTO dto) {
+        // SEC (C-02, Critical): el emisor SIEMPRE es quien está autenticado, nunca el
+        // idFuncionario que venga en el DTO — de lo contrario cualquiera podía crear
+        // solicitudes atribuidas a un tercero.
+        Long idFuncionarioEmisor = seguridadServicio.idUsuarioActual();
+        FuncionarioEntity funcionario = funcionarioRepository.findById(idFuncionarioEmisor)
+                .orElseThrow(() -> new RuntimeException("Funcionario emisor no existe"));
+
+        TipoSolicitudEntity tipoSolicitud = tipoSolicitudRepository.findById(dto.getIdTipoSolicitud())
+                .orElseThrow(() -> new RuntimeException("Tipo de solicitud no existe"));
+
+        FuncionarioEntity receptor = dto.getIdFuncionarioReceptor() != null ?
+                funcionarioRepository.findById(dto.getIdFuncionarioReceptor()).orElse(null) : null;
+
+        TurnoEntity turno = dto.getIdTurno() != null ?
+                turnoRepository.findById(dto.getIdTurno()).orElse(null) : null;
+
+        TurnoEntity turnoIntercambio = dto.getIdTurnoIntercambio() != null ?
+                turnoRepository.findById(dto.getIdTurnoIntercambio()).orElse(null) : null;
+
+        SolicitudEntity solicitud = SolicitudEntity.builder()
+                .funcionario(funcionario)
+                .funcionarioReceptor(receptor)
+                .tipoSolicitud(tipoSolicitud)
+                .turno(turno)
+                .turnoReceptor(turnoIntercambio)
+                .estado(SolicitudEntity.EstadoSolicitud.PENDIENTE)
+                .fechaCreacion(LocalDateTime.now())
+                .fechaInicioPermiso(dto.getFechaInicioPermiso())
+                .fechaTerminoPermiso(dto.getFechaTerminoPermiso())
+                .motivo(dto.getMotivo())
+                .aceptadoReceptor(null)
+                .build();
+
+        exigirTurnoPropioAlCrear(tipoSolicitud.getTipo(), turno, turnoIntercambio, idFuncionarioEmisor);
+        exigirTurnoPedidoDelReceptor(tipoSolicitud.getTipo(), turno, receptor);
+        exigirTurnosQueNoHanEmpezado(tipoSolicitud.getTipo(), turno, turnoIntercambio);
+
+        // Un turno solo puede estar comprometido en UNA solicitud pendiente del mismo funcionario,
+        // cuente como turno pedido o como turno entregado. Sin esto se podían apilar solicitudes
+        // contradictorias sobre el mismo turno. La garantía vive aquí porque dos pestañas o dos
+        // dispositivos evaden cualquier chequeo del frontend; GlobalExceptionHandler la convierte
+        // en 400 {"error": ...} y la UI muestra ese texto tal cual.
+        if (turno != null && solicitudRepository.existsByFuncionario_IdFuncionarioAndTurno_IdTurnoAndEstado(
+                idFuncionarioEmisor, turno.getIdTurno(), SolicitudEntity.EstadoSolicitud.PENDIENTE)) {
+            throw new RuntimeException("Ud. ya solicitó este turno. "
+                    + "Cancele la solicitud pendiente desde Solicitudes si desea cambiarla.");
+        }
+        if (turno != null && solicitudRepository.contarPendientesQueInvolucranTurno(
+                idFuncionarioEmisor, turno.getIdTurno(), SolicitudEntity.EstadoSolicitud.PENDIENTE) > 0) {
+            throw new RuntimeException("Ese turno ya está comprometido en otra solicitud pendiente suya. "
+                    + "Cancélela desde Solicitudes para pedir otra cosa sobre él.");
+        }
+        if (turnoIntercambio != null && solicitudRepository.contarPendientesQueInvolucranTurno(
+                idFuncionarioEmisor, turnoIntercambio.getIdTurno(), SolicitudEntity.EstadoSolicitud.PENDIENTE) > 0) {
+            throw new RuntimeException("El turno que ofreces entregar ya está comprometido en otra "
+                    + "solicitud pendiente suya. Cancélela desde Solicitudes para crear esta.");
+        }
+
+        validarConflictoSegunTipo(solicitud);
+
+        SolicitudEntity guardada = solicitudRepository.save(solicitud);
+
+        agendarBitacora("SOLICITUD_CREADA", guardada.getIdSolicitud(),
+                funcionario.getIdFuncionario());
+
+        return guardada;
+    }
+
+    /**
+     * SEC (S-01 b): liberar un turno (permiso con turno o «Botar turno»), cederlo (oferta
+     * particular) o entregarlo en un intercambio solo se puede con un turno propio. Antes solo lo
+     * limitaba la interfaz, que lista los turnos futuros del usuario; por API se podía
+     * comprometer el turno de otra persona.
+     */
+    private void exigirTurnoPropioAlCrear(Integer tipo, TurnoEntity turno, TurnoEntity turnoIntercambio, Long idEmisor) {
+        if (tipo == null) return;
+        if ((tipo == 1 || tipo == 2 || tipo == 5) && turno != null && !esDe(turno, idEmisor)) {
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "Ese turno no es tuyo: solo puedes liberar o ceder tus propios turnos");
+        }
+        if (tipo == 4 && turnoIntercambio != null && !esDe(turnoIntercambio, idEmisor)) {
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "El turno que ofreces entregar no es tuyo");
+        }
+    }
+
+    /**
+     * P-01 (HU-SOL-06): en un intercambio, el turno que se pide tiene que ser hoy del receptor.
+     * Antes se aceptaba cualquier turno, y la solicitud quedaba sobre un turno de un tercero que
+     * no participaba en ella.
+     */
+    private void exigirTurnoPedidoDelReceptor(Integer tipo, TurnoEntity turnoPedido, FuncionarioEntity receptor) {
+        if (!Integer.valueOf(4).equals(tipo)) return;
+        if (turnoPedido == null || receptor == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Para un intercambio, indica a la persona y el turno suyo que quieres");
+        }
+        if (!esDe(turnoPedido, receptor.getIdFuncionario())) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "El turno que pides no es de la persona con quien quieres intercambiar");
+        }
+    }
+
+    /**
+     * §5.1 (P-01, HU-SOL-05): no se bota, se cubre, se intercambia ni se cede un turno que ya
+     * empezó (tipos 2 a 5). Antes se aceptaba, por ejemplo, la cobertura de un cupo de la semana
+     * pasada. El permiso (tipo 1) es un registro de fechas y no se limita aquí.
+     */
+    private void exigirTurnosQueNoHanEmpezado(Integer tipo, TurnoEntity turno, TurnoEntity turnoIntercambio) {
+        if (tipo == null || tipo < 2 || tipo > 5) return;
+        LocalDateTime ahora = ahora();
+        if (yaEmpezo(turno, ahora)) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Ese turno ya empezó");
+        }
+        if (tipo == 4 && yaEmpezo(turnoIntercambio, ahora)) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "El turno que ofreces entregar ya empezó");
+        }
+    }
+
+    /** ¿El turno empezó a esta hora o antes? Sin fecha u hora de inicio no hay base para decirlo. */
+    private static boolean yaEmpezo(TurnoEntity turno, LocalDateTime ahora) {
+        if (turno == null || turno.getDiaInicioTurno() == null || turno.getHoraInicio() == null) return false;
+        return !turno.getDiaInicioTurno().atTime(turno.getHoraInicio()).isAfter(ahora);
+    }
+
+    /** ¿El turno está asignado a ese funcionario? */
+    private static boolean esDe(TurnoEntity turno, Long idFuncionario) {
+        return turno.getFuncionario() != null && idFuncionario != null
+                && idFuncionario.equals(turno.getFuncionario().getIdFuncionario());
+    }
+
+    /**
+     * SEC (S-01 a): al aprobar un permiso con turno, un «Botar turno» o una «Oferta particular», el
+     * turno debe seguir siendo de quien lo comprometió. Si cambió de dueño entre medio (una
+     * asignación manual, otra aprobación), aprobar liberaría o entregaría el turno de un tercero.
+     * Cobertura e Intercambio ya lo revisan en su rama de {@link #cambiarEstado}.
+     */
+    private void exigirTurnoAunDelEmisor(SolicitudEntity solicitud, Integer tipo) {
+        boolean comprometeSuTurno = Integer.valueOf(1).equals(tipo) || Integer.valueOf(2).equals(tipo)
+                || Integer.valueOf(5).equals(tipo);
+        if (!comprometeSuTurno || solicitud.getTurno() == null) return;
+        Long idEmisor = solicitud.getFuncionario() != null ? solicitud.getFuncionario().getIdFuncionario() : null;
+        if (!esDe(solicitud.getTurno(), idEmisor)) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "El turno ya cambió de dueño: la solicitud quedó obsoleta");
+        }
+    }
+
+    // ============================ Validación de 12 horas consecutivas ============================
+
+    /**
+     * Valida, según el tipo de solicitud, que el/los funcionario(s) que terminarían con un turno
+     * nuevo no queden con superposición ni con una secuencia incompatible de 12 horas. Se usa tanto
+     * al crear la solicitud (aviso temprano) como al aprobarla (revalidación obligatoria y definitiva
+     * con el calendario más reciente). Los tipos 1 (Permiso) y 2 (Botar turno) solo liberan un turno,
+     * nunca agregan uno, por lo que no requieren esta validación.
+     */
+    private void validarConflictoSegunTipo(SolicitudEntity solicitud) {
+        Integer tipo = solicitud.getTipoSolicitud() != null ? solicitud.getTipoSolicitud().getTipo() : null;
+        if (tipo == null) return;
+
+        if (tipo.equals(3)) {
+            // Cobertura: el emisor tomaría el turno.
+            TurnoEntity turno = solicitud.getTurno();
+            FuncionarioEntity emisor = solicitud.getFuncionario();
+            if (turno != null && emisor != null) {
+                validarNuevoTurnoParaFuncionario(emisor, turno, List.of());
+            }
+        } else if (tipo.equals(4)) {
+            // Intercambio: el emisor recibe turnoDeseado (solicitud.turno), el receptor recibe
+            // turnoPropio (solicitud.turnoReceptor). Se simula excluyendo de cada calendario el
+            // turno que esa persona está entregando, antes de validar el que recibe.
+            TurnoEntity turnoDeseado = solicitud.getTurno();
+            TurnoEntity turnoPropio = solicitud.getTurnoReceptor();
+            FuncionarioEntity emisor = solicitud.getFuncionario();
+            FuncionarioEntity receptor = solicitud.getFuncionarioReceptor();
+            if (turnoDeseado != null && turnoPropio != null && emisor != null && receptor != null) {
+                validarNuevoTurnoParaFuncionario(emisor, turnoDeseado, List.of(turnoPropio.getIdTurno()));
+                validarNuevoTurnoParaFuncionario(receptor, turnoPropio, List.of(turnoDeseado.getIdTurno()));
+            }
+        } else if (tipo.equals(5)) {
+            // Oferta particular: el receptor tomaría el turno.
+            TurnoEntity turno = solicitud.getTurno();
+            FuncionarioEntity receptor = solicitud.getFuncionarioReceptor();
+            if (turno != null && receptor != null) {
+                validarNuevoTurnoParaFuncionario(receptor, turno, List.of());
+            }
+        }
+        // Tipos 1 y 2 (Permiso, Botar turno): solo liberan, no requieren validar.
+    }
+
+    /**
+     * Valida que {@code turnoCandidato} pueda asignarse a {@code funcionario} contra su calendario
+     * vigente actual (en cualquier servicio), excluyendo de ese calendario los turnos que el propio
+     * movimiento le hace entregar simultáneamente (relevante en un intercambio).
+     */
+    private void validarNuevoTurnoParaFuncionario(FuncionarioEntity funcionario, TurnoEntity turnoCandidato,
+            List<Long> idsExcluirDelCalendario) {
+        if (turnoCandidato.getDiaInicioTurno() == null || turnoCandidato.getHoraInicio() == null
+                || turnoCandidato.getDiaFinalTurno() == null || turnoCandidato.getHoraFin() == null) {
+            return; // datos incompletos (p. ej. en pruebas unitarias): no hay base temporal para validar.
+        }
+
+        List<TurnoEntity> vigentes = turnoRepository.findByFuncionario_IdFuncionario(funcionario.getIdFuncionario());
+        Long[] idsExcluir = idsExcluirDelCalendario.toArray(new Long[0]);
+        List<TurnoEntity> calendarioResultante = validadorAsignacion.excluyendo(vigentes, idsExcluir);
+
+        LocalDateTime nuevoInicio = turnoCandidato.getDiaInicioTurno().atTime(turnoCandidato.getHoraInicio());
+        LocalDateTime nuevoFin = turnoCandidato.getDiaFinalTurno().atTime(turnoCandidato.getHoraFin());
+
+        // RG-27: el aviso cita el turno que choca; con el servicio del candidato nombra el del que choca si es otro.
+        validadorAsignacion.validarAsignacion(
+                nombreCompleto(funcionario), nuevoInicio, nuevoFin, turnoCandidato.getIdTurno(), calendarioResultante,
+                AlcanceServicio.servicioDe(turnoCandidato));
+    }
+
+    private String nombreCompleto(FuncionarioEntity f) {
+        if (f == null) return "el funcionario";
+        return (f.getNombre() + (f.getApelPat() != null ? " " + f.getApelPat() : "")).trim();
+    }
+
+    /**
+     * Cancela una solicitud PENDIENTE propia. Es la contraparte del bloqueo "un turno comprometido
+     * a la vez": si el funcionario se arrepiente, cancela y el turno vuelve a quedar libre para
+     * pedir otra cosa. Solo el emisor puede cancelar la suya, y solo mientras siga pendiente
+     * (aprobarla o rechazarla sigue siendo potestad de jefatura, vía {@link #cambiarEstado}).
+     *
+     * <p>Se marca RECHAZADA con un motivo explícito en lugar de introducir un estado CANCELADA:
+     * la columna Estado es un enum de base de datos y agregar un valor exigiría una migración
+     * coordinada. El evento de bitácora SÍ distingue el caso (SOLICITUD_CANCELADA).
+     */
+    @Transactional(dontRollbackOn = VencidoPorInicioException.class)
+    public SolicitudEntity cancelarSolicitud(Long idSolicitud) {
+        Long idUsuario = seguridadServicio.idUsuarioActual();
+
+        // Lock de la fila ANTES de mirar el estado — la misma disciplina que la aprobación
+        // (cambiarEstado). Sin esto, cancelar en paralelo con una aprobación podía "ganar"
+        // después del commit ajeno: los turnos quedaban movidos y la solicitud RECHAZADA.
+        SolicitudEntity solicitud = solicitudRepository.findByIdForUpdate(idSolicitud)
+                .orElseThrow(() -> new RuntimeException("La solicitud no existe"));
+
+        if (solicitud.getFuncionario() == null
+                || !solicitud.getFuncionario().getIdFuncionario().equals(idUsuario)) {
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "Solo puedes cancelar tus propias solicitudes");
+        }
+        exigirNoVencida(solicitud);
+        if (solicitud.getEstado() != SolicitudEntity.EstadoSolicitud.PENDIENTE) {
+            throw new RuntimeException("Esta solicitud ya fue resuelta: no se puede cancelar");
+        }
+
+        solicitud.setEstado(SolicitudEntity.EstadoSolicitud.RECHAZADA);
+        solicitud.setMotivo("Cancelada por el solicitante"
+                + (solicitud.getMotivo() != null && !solicitud.getMotivo().isBlank()
+                        ? " · motivo original: " + solicitud.getMotivo() : ""));
+
+        SolicitudEntity guardada = solicitudRepository.save(solicitud);
+        agendarBitacora("SOLICITUD_CANCELADA", guardada.getIdSolicitud(), idUsuario);
+        return guardada;
+    }
+
+    /**
+     * Registra la respuesta del receptor a una oferta particular. Aceptar solo marca
+     * {@code aceptadoReceptor}; no reasigna el turno (eso lo hace la aprobación de jefatura
+     * en {@link #cambiarEstado}). Rechazar sí resuelve la solicitud directamente (RECHAZADA).
+     */
+    @Transactional(dontRollbackOn = VencidoPorInicioException.class)
+    public SolicitudEntity responderOfertaParticular(Long idSolicitud, boolean acepta) {
+        // SEC (C-02, Critical): el receptor SIEMPRE es quien está autenticado, nunca un
+        // idReceptor de query param — de lo contrario cualquiera podía aceptar/rechazar
+        // ofertas dirigidas a otro funcionario.
+        Long idReceptor = seguridadServicio.idUsuarioActual();
+        SolicitudEntity solicitud = solicitudRepository.findById(idSolicitud)
+                .orElseThrow(() -> new RuntimeException("Solicitud no existe"));
+
+        if (solicitud.getFuncionarioReceptor() == null || !solicitud.getFuncionarioReceptor().getIdFuncionario().equals(idReceptor)) {
+            throw new RuntimeException("No eres el receptor de esta solicitud");
+        }
+        exigirNoVencida(solicitud);
+        exigirPendienteParaResponder(solicitud);
+        exigirSinRespuestaPrevia(solicitud);
+
+        FuncionarioEntity receptor = funcionarioRepository.findById(idReceptor).orElseThrow();
+
+        if (acepta) {
+            validarConflictoSegunTipo(solicitud); // aviso temprano; la aprobación revalida de todos modos
+            solicitud.setAceptadoReceptor(true);
+        } else {
+            solicitud.setAceptadoReceptor(false);
+            solicitud.setEstado(SolicitudEntity.EstadoSolicitud.RECHAZADA);
+        }
+
+        SolicitudEntity guardada = solicitudRepository.save(solicitud);
+
+        String evento = acepta ? "OFERTA_PARTICULAR_ACEPTADA_POR_RECEPTOR" : "OFERTA_PARTICULAR_RECHAZADA_POR_RECEPTOR";
+        agendarBitacora(evento, guardada.getIdSolicitud(), receptor.getIdFuncionario());
+
+        return guardada;
+    }
+
+    /** Igual que {@link #responderOfertaParticular} pero para solicitudes de intercambio. */
+    @Transactional(dontRollbackOn = VencidoPorInicioException.class)
+    public SolicitudEntity responderOfertaIntercambio(Long idSolicitud, boolean acepta) {
+        // SEC (C-02, Critical): igual que en responderOfertaParticular, el receptor se
+        // deriva del token, nunca del parámetro.
+        Long idReceptor = seguridadServicio.idUsuarioActual();
+        SolicitudEntity solicitud = solicitudRepository.findById(idSolicitud)
+                .orElseThrow(() -> new RuntimeException("Solicitud no existe"));
+
+        if (solicitud.getFuncionarioReceptor() == null || !solicitud.getFuncionarioReceptor().getIdFuncionario().equals(idReceptor)) {
+            throw new RuntimeException("No eres el receptor de esta solicitud");
+        }
+        exigirNoVencida(solicitud);
+        exigirPendienteParaResponder(solicitud);
+        exigirSinRespuestaPrevia(solicitud);
+
+        FuncionarioEntity receptor = funcionarioRepository.findById(idReceptor).orElseThrow();
+
+        if (acepta) {
+            validarConflictoSegunTipo(solicitud); // aviso temprano; la aprobación revalida de todos modos
+            solicitud.setAceptadoReceptor(true);
+        } else {
+            solicitud.setAceptadoReceptor(false);
+            solicitud.setEstado(SolicitudEntity.EstadoSolicitud.RECHAZADA);
+        }
+
+        SolicitudEntity guardada = solicitudRepository.save(solicitud);
+
+        String evento = acepta ? "OFERTA_ACEPTADA_POR_RECEPTOR" : "OFERTA_RECHAZADA_POR_RECEPTOR";
+        agendarBitacora(evento, guardada.getIdSolicitud(), receptor.getIdFuncionario());
+
+        return guardada;
+    }
+
+    /**
+     * SEC (S-01 c): el receptor responde solo mientras la solicitud esté PENDIENTE. Antes podía
+     * rechazar por API una solicitud ya APROBADA (quedaba RECHAZADA con los turnos ya movidos).
+     */
+    private void exigirPendienteParaResponder(SolicitudEntity solicitud) {
+        if (solicitud.getEstado() != SolicitudEntity.EstadoSolicitud.PENDIENTE) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "Esta solicitud ya fue resuelta: no se puede responder");
+        }
+    }
+
+    /**
+     * HU-SOL-08 (P-01): el receptor responde una sola vez. Antes podía aceptar y, mientras la
+     * jefatura no decidía, rechazar (o aceptar de nuevo) por API. Se revisa después del estado: una
+     * solicitud ya resuelta sigue respondiendo «Esta solicitud ya fue resuelta…».
+     */
+    private void exigirSinRespuestaPrevia(SolicitudEntity solicitud) {
+        if (solicitud.getAceptadoReceptor() != null) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Ya respondiste esta solicitud");
+        }
+    }
+
+    /**
+     * Resuelve una solicitud cambiándole el estado. Es aquí donde, al aprobar, se mueven
+     * de verdad los turnos:
+     * <ul>
+     *   <li>Tipo 1/2 (permiso / botar turno): libera el turno (funcionario = null).</li>
+     *   <li>Tipo 3 (cobertura): asigna el funcionario solicitante al turno.</li>
+     *   <li>Tipo 4 (intercambio): intercambia el funcionario entre el turno deseado y el propio.</li>
+     *   <li>Tipo 5 (oferta particular): asigna el funcionario receptor al turno.</li>
+     * </ul>
+     * Antes de tocar nada, bloquea (lock pesimista) el/los turno(s) involucrados para serializar
+     * aprobaciones concurrentes que compitan por el mismo turno, relee la solicitud con lock propio
+     * (por si otra aprobación ya la resolvió mientras se esperaba el lock) y rechaza automáticamente
+     * cualquier otra solicitud PENDIENTE que apunte al mismo turno.
+     */
+    @Transactional(dontRollbackOn = VencidoPorInicioException.class)
+    public SolicitudEntity cambiarEstado(Long idSolicitud, SolicitudEntity.EstadoSolicitud nuevoEstado) {
+        SolicitudEntity solicitud = solicitudRepository.findById(idSolicitud)
+                .orElseThrow(() -> new RuntimeException("Solicitud no existe"));
+
+        // SEC (C-02, Critical): quien resuelve la solicitud SIEMPRE es quien está
+        // autenticado, nunca un idUsuarioAsignador de query param — de lo contrario
+        // cualquiera podía aprobar/rechazar solicitudes atribuyendo la acción a un tercero
+        // (falsificación de la bitácora de auditoría).
+        Long idUsuarioAsignador = seguridadServicio.idUsuarioActual();
+        FuncionarioEntity asignador = funcionarioRepository.findById(idUsuarioAsignador).orElse(null);
+
+        Integer tipoSolicitud = solicitud.getTipoSolicitud().getTipo();
+
+        // SEC (H-07, High): segregación de funciones completa — nadie con un interés directo
+        // en la operación (emisor, receptor/beneficiario, o dueño actual de cualquiera de los
+        // turnos involucrados) puede resolverla, sin excepción de rol: ni JEFATURA, ni
+        // SUBROGANTE, ni ADMINISTRADOR. El ADMINISTRADOR solo queda exento del chequeo de
+        // *servicio* (más abajo), nunca de este.
+        if (participantesDirectos(solicitud).contains(idUsuarioAsignador)) {
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "No puedes aprobar ni rechazar una solicitud en la que participas directamente");
+        }
+
+        // SEC (H-07/H-01, High): la solicitud debe pertenecer al servicio de la sesión de
+        // quien la resuelve (salvo ADMINISTRADOR) — antes cualquier JEFATURA/SUBROGANTE
+        // podía resolver solicitudes de otro servicio. Los IDs de servicio se leen SIEMPRE
+        // desde las entidades cargadas de BD (turno/turnoReceptor/funcionario), nunca de
+        // parámetros del cliente.
+        if (!seguridadServicio.esAdministrador()) {
+            Long servicioSesion = seguridadServicio.idServicioActual();
+            if (Integer.valueOf(4).equals(tipoSolicitud)) {
+                // Intercambio: involucra DOS turnos que pueden pertenecer a servicios
+                // distintos. Ambos deben coincidir con el servicio del resolutor — de lo
+                // contrario, una jefatura del servicio del turno deseado podía aprobar un
+                // intercambio que también reasigna el turno entregado en un servicio ajeno
+                // que no controla.
+                Long servicioTurnoDeseado = servicioDe(solicitud.getTurno());
+                Long servicioTurnoEntregado = servicioDe(solicitud.getTurnoReceptor());
+                boolean ambosDelServicio = servicioTurnoDeseado != null && servicioTurnoDeseado.equals(servicioSesion)
+                        && servicioTurnoEntregado != null && servicioTurnoEntregado.equals(servicioSesion);
+                if (!ambosDelServicio) {
+                    throw new org.springframework.security.access.AccessDeniedException(
+                            "El intercambio involucra un turno de otro servicio");
+                }
+            } else {
+                boolean turnoDelServicio = solicitud.getTurno() != null
+                        && solicitud.getTurno().getServicio() != null
+                        && solicitud.getTurno().getServicio().getIdServicio().equals(servicioSesion);
+                boolean emisorDelServicio = funcionarioPerteneceAServicio(solicitud.getFuncionario(), servicioSesion);
+                if (!turnoDelServicio && !emisorDelServicio) {
+                    throw new org.springframework.security.access.AccessDeniedException(
+                            "No tienes acceso a solicitudes de otro servicio");
+                }
+            }
+        }
+
+        // 23 oct: una pendiente cuyo turno ya empezó no está vigente: se cierra (queda guardado) y se avisa.
+        exigirNoVencida(solicitud);
+
+        // SEC (S-01 c): una solicitud ya resuelta no se vuelve a decidir. Antes se podía pasar a
+        // RECHAZADA (o de vuelta a PENDIENTE) una solicitud APROBADA, con sus turnos ya movidos.
+        // La aprobación lo revisa más abajo, con la fila bloqueada.
+        if (nuevoEstado != SolicitudEntity.EstadoSolicitud.APROBADA
+                && solicitud.getEstado() != SolicitudEntity.EstadoSolicitud.PENDIENTE) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "Esta solicitud ya fue resuelta: no se puede cambiar su estado");
+        }
+
+        if (nuevoEstado == SolicitudEntity.EstadoSolicitud.APROBADA) {
+            // Serializa aprobaciones concurrentes que compiten por el/los mismo(s) turno(s):
+            // se bloquean los turnos involucrados ANTES de tocar cualquier solicitud. En el
+            // intercambio (tipo 4) hay dos turnos; se bloquean siempre ordenados por id para que
+            // dos intercambios cruzados nunca se esperen mutuamente en sentido opuesto (deadlock).
+            lockTurnosInvolucrados(solicitud, tipoSolicitud);
+
+            // Tras obtener el lock, se relee la solicitud CON LOCK PROPIO: una lectura normal
+            // seguiría viendo la foto de antes de esperar (snapshot de la transacción), por lo
+            // que si otra aprobación concurrente ya la resolvió mientras esperábamos, esto lo
+            // detecta con datos frescos.
+            solicitud = solicitudRepository.findByIdForUpdate(idSolicitud)
+                    .orElseThrow(() -> new RuntimeException("Solicitud no existe"));
+            if (solicitud.getEstado() != SolicitudEntity.EstadoSolicitud.PENDIENTE) {
+                throw new RuntimeException(
+                        "Esta solicitud ya no está pendiente (probablemente otra jefatura ya la resolvió)");
+            }
+
+            // SEC (C-11, RN-SGT-019): un intercambio o una oferta particular se aprueba solo
+            // después de que el receptor la aceptó. Antes solo lo exigía la interfaz, y por API
+            // se aprobaba un intercambio que el receptor nunca aceptó.
+            if ((Integer.valueOf(4).equals(tipoSolicitud) || Integer.valueOf(5).equals(tipoSolicitud))
+                    && !Boolean.TRUE.equals(solicitud.getAceptadoReceptor())) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT,
+                        "El receptor todavía no acepta esta solicitud: no se puede aprobar");
+            }
+
+            exigirTurnoAunDelEmisor(solicitud, tipoSolicitud);
+
+            // Revalidación OBLIGATORIA y definitiva con el calendario más reciente: el funcionario
+            // pudo haber tomado otro turno entre la creación de la solicitud y esta aprobación.
+            validarConflictoSegunTipo(solicitud);
+
+            if (solicitud.getTurno() != null) {
+                rechazarSolicitudesCompetitivas(solicitud.getTurno().getIdTurno(), idSolicitud, asignador);
+            }
+            // En un intercambio también cambia de dueño el turno ENTREGADO: las solicitudes
+            // pendientes que lo pidan o lo ofrezcan quedan apuntando a un turno que ya no es
+            // de quien lo comprometió — se barren igual que las del turno principal.
+            if (solicitud.getTurnoReceptor() != null) {
+                rechazarSolicitudesCompetitivas(solicitud.getTurnoReceptor().getIdTurno(), idSolicitud, asignador);
+            }
+
+            if (tipoSolicitud.equals(1) || tipoSolicitud.equals(2)) {
+                TurnoEntity turno = solicitud.getTurno();
+                if (turno != null) {
+                    turno.setFuncionario(null);
+                    turnoRepository.save(turno);
+                }
+            } else if (tipoSolicitud.equals(3)) {
+                TurnoEntity turno = solicitud.getTurno();
+                if (turno == null) {
+                    throw new RuntimeException("La solicitud de cobertura no tiene un turno asociado");
+                }
+                // El cupo pudo llenarse por otra vía (asignación manual, oferta) entre la
+                // creación y esta aprobación: nunca pisar al ocupante en silencio.
+                if (turno.getFuncionario() != null
+                        && !turno.getFuncionario().getIdFuncionario().equals(
+                                solicitud.getFuncionario().getIdFuncionario())) {
+                    throw new RuntimeException("Este turno ya fue asignado a otra persona");
+                }
+                turno.setFuncionario(solicitud.getFuncionario());
+                turnoRepository.save(turno);
+            } else if (tipoSolicitud.equals(4)) {
+                TurnoEntity turnoDeseado = solicitud.getTurno();
+                TurnoEntity turnoPropio = solicitud.getTurnoReceptor();
+                if (turnoDeseado == null || turnoPropio == null) {
+                    throw new RuntimeException("La solicitud de intercambio no tiene ambos turnos asociados");
+                }
+                // Los turnos deben seguir en manos de quienes pactaron el canje: si alguno
+                // cambió de dueño por otra vía (otra aprobación, asignación manual), aprobar
+                // esto le quitaría un turno a un tercero ajeno a la solicitud.
+                if (turnoDeseado.getFuncionario() != null && solicitud.getFuncionarioReceptor() != null
+                        && !turnoDeseado.getFuncionario().getIdFuncionario().equals(
+                                solicitud.getFuncionarioReceptor().getIdFuncionario())) {
+                    throw new RuntimeException("El turno solicitado ya cambió de dueño: el intercambio quedó obsoleto");
+                }
+                if (turnoPropio.getFuncionario() != null && solicitud.getFuncionario() != null
+                        && !turnoPropio.getFuncionario().getIdFuncionario().equals(
+                                solicitud.getFuncionario().getIdFuncionario())) {
+                    throw new RuntimeException("El turno ofrecido ya cambió de dueño: el intercambio quedó obsoleto");
+                }
+                turnoDeseado.setFuncionario(solicitud.getFuncionario());
+                turnoPropio.setFuncionario(solicitud.getFuncionarioReceptor());
+                turnoRepository.save(turnoDeseado);
+                turnoRepository.save(turnoPropio);
+            } else if (tipoSolicitud.equals(5)) {
+                TurnoEntity turno = solicitud.getTurno();
+                if (turno == null) {
+                    throw new RuntimeException("La solicitud de oferta particular no tiene un turno asociado");
+                }
+                turno.setFuncionario(solicitud.getFuncionarioReceptor());
+                turnoRepository.save(turno);
+            }
+        }
+
+        solicitud.setEstado(nuevoEstado);
+        SolicitudEntity guardada = solicitudRepository.save(solicitud);
+
+        Long idAsignador = asignador != null ? asignador.getIdFuncionario() : null;
+        agendarBitacora("CAMBIO_ESTADO_" + nuevoEstado.name(), guardada.getIdSolicitud(), idAsignador);
+
+        return guardada;
+    }
+
+    /** ¿El funcionario tiene una asignación vigente al servicio indicado? */
+    private boolean funcionarioPerteneceAServicio(FuncionarioEntity funcionario, Long servicioId) {
+        if (funcionario == null || funcionario.getServiciosFuncionario() == null || servicioId == null) return false;
+        return funcionario.getServiciosFuncionario().stream()
+                .anyMatch(sf -> sf.getServicio() != null && servicioId.equals(sf.getServicio().getIdServicio()));
+    }
+
+    /** Id de servicio del turno, o {@code null} si el turno o su servicio no están cargados. */
+    private Long servicioDe(TurnoEntity turno) {
+        return (turno != null && turno.getServicio() != null) ? turno.getServicio().getIdServicio() : null;
+    }
+
+    /**
+     * Todos los funcionarios con un interés directo en la solicitud — emisor, receptor
+     * (intercambio/oferta particular), y dueño actual de cada turno involucrado — ninguno de
+     * ellos puede resolverla (aprobar/rechazar), sea cual sea su rol (SEC H-07).
+     */
+    private java.util.Set<Long> participantesDirectos(SolicitudEntity solicitud) {
+        java.util.Set<Long> ids = new java.util.HashSet<>();
+        agregarIdSiPresente(ids, solicitud.getFuncionario());
+        agregarIdSiPresente(ids, solicitud.getFuncionarioReceptor());
+        if (solicitud.getTurno() != null) {
+            agregarIdSiPresente(ids, solicitud.getTurno().getFuncionario());
+        }
+        if (solicitud.getTurnoReceptor() != null) {
+            agregarIdSiPresente(ids, solicitud.getTurnoReceptor().getFuncionario());
+        }
+        return ids;
+    }
+
+    private void agregarIdSiPresente(java.util.Set<Long> ids, FuncionarioEntity funcionario) {
+        if (funcionario != null && funcionario.getIdFuncionario() != null) {
+            ids.add(funcionario.getIdFuncionario());
+        }
+    }
+
+    private void lockTurnosInvolucrados(SolicitudEntity solicitud, Integer tipoSolicitud) {
+        if (Integer.valueOf(4).equals(tipoSolicitud)) {
+            Long idTurnoDeseado = solicitud.getTurno() != null ? solicitud.getTurno().getIdTurno() : null;
+            Long idTurnoPropio = solicitud.getTurnoReceptor() != null ? solicitud.getTurnoReceptor().getIdTurno() : null;
+            Stream.of(idTurnoDeseado, idTurnoPropio)
+                    .filter(Objects::nonNull)
+                    .sorted()
+                    .forEach(turnoRepository::findByIdForUpdate);
+        } else if (solicitud.getTurno() != null) {
+            turnoRepository.findByIdForUpdate(solicitud.getTurno().getIdTurno());
+        }
+    }
+
+    private void rechazarSolicitudesCompetitivas(Long idTurno, Long idSolicitudAprobada, FuncionarioEntity asignador) {
+        Long idAsignador = asignador != null ? asignador.getIdFuncionario() : null;
+
+        // Competidoras por ambos lados: las que PIDEN este turno y las que lo OFRECEN
+        // entregar (turnoReceptor de un intercambio). Ambas quedan sin sustento cuando
+        // el turno cambia de dueño.
+        java.util.stream.Stream.concat(
+                        solicitudRepository.findByTurno_IdTurno(idTurno).stream(),
+                        solicitudRepository.findByTurnoReceptor_IdTurno(idTurno).stream())
+                .distinct()
+                .filter(s -> s.getEstado() == SolicitudEntity.EstadoSolicitud.PENDIENTE
+                        && !s.getIdSolicitud().equals(idSolicitudAprobada))
+                .forEach(conflicto -> {
+                    conflicto.setEstado(SolicitudEntity.EstadoSolicitud.RECHAZADA);
+                    conflicto.setMotivo("Rechazo automático: Otra solicitud para este turno fue aprobada.");
+                    SolicitudEntity guardado = solicitudRepository.save(conflicto);
+                    agendarBitacora("RECHAZO_AUTOMATICO", guardado.getIdSolicitud(), idAsignador);
+                });
+    }
+
+    /**
+     * §5.1 (P-01): la gestión asignó, reasignó o liberó el turno a mano
+     * ({@code GestionTurnoService}). Las solicitudes PENDIENTES que lo piden o lo entregan quedan
+     * sin sustento, igual que las competidoras de una aprobación (R10): pasan a RECHAZADA con un
+     * motivo automático, que conserva el motivo original como en una cancelación (R15), y cada
+     * una deja su evento {@code RECHAZO_AUTOMATICO} en la bitácora. Antes seguían pendientes y la
+     * jefatura podía aprobar después sobre un turno que ya había cambiado de dueño.
+     *
+     * <p>Se llama con el turno ya bloqueado por {@code alterarTurno}; cada solicitud se relee con
+     * lock por si una cancelación o la respuesta del receptor la resolvió entre medio.
+     *
+     * @param motivoAutomatico p. ej. «Rechazo automático: El turno fue asignado manualmente.».
+     * @return cuántas solicitudes quedaron rechazadas.
+     */
+    @Transactional
+    public int rechazarPendientesPorCambioManual(Long idTurno, Long idActor, String motivoAutomatico) {
+        java.util.Set<Long> pendientes = new java.util.LinkedHashSet<>();
+        Stream.concat(
+                        solicitudRepository.findByTurno_IdTurno(idTurno).stream(),
+                        solicitudRepository.findByTurnoReceptor_IdTurno(idTurno).stream())
+                .filter(s -> s.getEstado() == SolicitudEntity.EstadoSolicitud.PENDIENTE)
+                .forEach(s -> pendientes.add(s.getIdSolicitud()));
+
+        int rechazadas = 0;
+        for (Long idSolicitud : pendientes) {
+            SolicitudEntity solicitud = solicitudRepository.findByIdForUpdate(idSolicitud).orElse(null);
+            if (solicitud == null || solicitud.getEstado() != SolicitudEntity.EstadoSolicitud.PENDIENTE) continue;
+
+            solicitud.setEstado(SolicitudEntity.EstadoSolicitud.RECHAZADA);
+            solicitud.setMotivo(motivoAutomatico
+                    + (solicitud.getMotivo() != null && !solicitud.getMotivo().isBlank()
+                            ? " · motivo original: " + solicitud.getMotivo() : ""));
+            solicitudRepository.save(solicitud);
+            agendarBitacora("RECHAZO_AUTOMATICO", idSolicitud, idActor);
+            rechazadas++;
+        }
+        return rechazadas;
+    }
+
+    // ============================ Vencimiento (23 oct 2026) ============================
+
+    /**
+     * ¿Alguno de los turnos que compromete la solicitud ya empezó? Cuentan el turno pedido y, en un
+     * intercambio, el que se entrega. Una solicitud sin turno (un permiso solo con fechas) no vence.
+     */
+    private static boolean tieneTurnoEmpezado(SolicitudEntity solicitud, LocalDateTime ahora) {
+        return yaEmpezo(solicitud.getTurno(), ahora) || yaEmpezo(solicitud.getTurnoReceptor(), ahora);
+    }
+
+    /**
+     * Cierra todas las solicitudes PENDIENTES (de cualquier tipo) cuyo turno ya empezó: quedan
+     * RECHAZADAS con {@link #MOTIVO_VENCIDA} y un evento de sistema en la bitácora. Es lo que corre la
+     * tarea programada ({@code VencimientoProgramado}); no depende de ninguna sesión.
+     *
+     * @return cuántas solicitudes se cerraron.
+     */
+    @Transactional
+    public int vencerPendientesDeTurnosEmpezados() {
+        LocalDateTime ahora = ahora();
+        List<Long> vencidas = solicitudRepository.findByEstado(SolicitudEntity.EstadoSolicitud.PENDIENTE).stream()
+                .filter(s -> tieneTurnoEmpezado(s, ahora))
+                .map(SolicitudEntity::getIdSolicitud)
+                .toList();
+        int cerradas = 0;
+        for (Long id : vencidas) {
+            if (vencerSiCorresponde(id, ahora)) cerradas++;
+        }
+        return cerradas;
+    }
+
+    /**
+     * Al leer una lista: las pendientes cuyo turno ya empezó se cierran antes de entregarlas, para que
+     * nunca se vea vigente algo vencido aunque la tarea programada no haya corrido todavía.
+     */
+    private List<SolicitudEntity> vencerAlLeer(List<SolicitudEntity> solicitudes) {
+        LocalDateTime ahora = ahora();
+        solicitudes.stream()
+                .filter(s -> s.getEstado() == SolicitudEntity.EstadoSolicitud.PENDIENTE && tieneTurnoEmpezado(s, ahora))
+                .map(SolicitudEntity::getIdSolicitud)
+                .toList()
+                .forEach(id -> vencerSiCorresponde(id, ahora));
+        return solicitudes;
+    }
+
+    /**
+     * Antes de resolver una solicitud (aprobar, rechazar, cancelar, responder): si venció, se cierra y
+     * el que intenta resolverla recibe un 409. El cierre queda guardado ({@link VencidoPorInicioException}).
+     */
+    private void exigirNoVencida(SolicitudEntity solicitud) {
+        if (solicitud.getEstado() != SolicitudEntity.EstadoSolicitud.PENDIENTE) return;
+        LocalDateTime ahora = ahora();
+        if (tieneTurnoEmpezado(solicitud, ahora) && vencerSiCorresponde(solicitud.getIdSolicitud(), ahora)) {
+            throw new VencidoPorInicioException(
+                    "Esta solicitud venció: el turno ya comenzó, así que ya no se puede resolver");
+        }
+    }
+
+    /** Relee la solicitud con lock y, si sigue pendiente y su turno empezó, la cierra. */
+    private boolean vencerSiCorresponde(Long idSolicitud, LocalDateTime ahora) {
+        SolicitudEntity solicitud = solicitudRepository.findByIdForUpdate(idSolicitud).orElse(null);
+        if (solicitud == null || solicitud.getEstado() != SolicitudEntity.EstadoSolicitud.PENDIENTE
+                || !tieneTurnoEmpezado(solicitud, ahora)) {
+            return false;
+        }
+        solicitud.setEstado(SolicitudEntity.EstadoSolicitud.RECHAZADA);
+        solicitud.setMotivo(MOTIVO_VENCIDA
+                + (solicitud.getMotivo() != null && !solicitud.getMotivo().isBlank()
+                        ? " · motivo original: " + solicitud.getMotivo() : ""));
+        solicitudRepository.save(solicitud);
+        agendarBitacora(EVENTO_VENCIDA, idSolicitud, null); // sin actor humano: lo hace el sistema
+        return true;
+    }
+
+    /** Solo permitido mientras la solicitud está {@code PENDIENTE}, y solo por quien la emitió. */
+    @Transactional
+    public SolicitudEntity modificarMotivo(Long idSolicitud, String nuevoMotivo) {
+        SolicitudEntity solicitud = solicitudRepository.findById(idSolicitud)
+                .orElseThrow(() -> new RuntimeException("Solicitud no existe"));
+        if (solicitud.getEstado() != SolicitudEntity.EstadoSolicitud.PENDIENTE) {
+            throw new RuntimeException("Solo se puede modificar el motivo si la solicitud está en estado PENDIENTE");
+        }
+        // SEC (IDOR): sin esto, cualquier usuario autenticado podía reescribir el motivo de
+        // la solicitud de otro funcionario.
+        Long idActual = seguridadServicio.idUsuarioActual();
+        boolean esEmisor = solicitud.getFuncionario() != null
+                && idActual.equals(solicitud.getFuncionario().getIdFuncionario());
+        if (!esEmisor && !seguridadServicio.esAdministrador()) {
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "Solo quien emitió la solicitud puede modificar su motivo");
+        }
+        solicitud.setMotivo(nuevoMotivo);
+        return solicitudRepository.save(solicitud);
+    }
+
+    // Registra el evento en bitácora DESPUÉS de que la TX principal commitee,
+    // evitando lock conflicts por FKs a filas aún no commiteadas.
+    private void agendarBitacora(String evento, Long idSolicitud, Long idFuncionario) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            bitacoraService.registrarEvento(evento, idSolicitud, idFuncionario);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                bitacoraService.registrarEvento(evento, idSolicitud, idFuncionario);
+            }
+        });
+    }
+}

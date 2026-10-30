@@ -1,0 +1,10 @@
+# Credenciales/config local — nunca versionar.
+.env
+.env.dev
+.env.*.local
+# Ambiente local de pruebas (docker-compose.local.yml): la plantilla es .env.local.example
+.env.local
+.claude
+# Despliegue en VM propia — credenciales reales, nunca versionar.
+.env.hetzner
+backups/
